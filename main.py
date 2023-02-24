@@ -14,7 +14,6 @@ def create_obj():
     objs = list()
     for k,v in _hosts.items():
         for p in _ports:
-            print(k,p)
             objs.append(Gauge(f"{_hostname}__{k}:{p}__stackname", "Some_metric"))
     return objs
 
@@ -22,7 +21,7 @@ _objs = create_obj()
 
 def get_metric(_target, _port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
+    sock.settimeout(0.1)
     result = sock.connect_ex((_target, _port))
     print(result)
     x = 0
@@ -34,12 +33,15 @@ def get_metric(_target, _port):
     return (x)
 
 def collect_metrics():
+    start = time.time()
     i = 0
     for k,v in _hosts.items():
         for p in _ports:
             _value = get_metric(v,p)
             _objs[i].set(_value)
             i += 1
+    end = time.time()
+    print(end - start)
 
 if __name__ == '__main__':
     # Start up the server to expose the metrics.
