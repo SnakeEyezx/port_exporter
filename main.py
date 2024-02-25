@@ -1,7 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 from prometheus_client import start_http_server, Gauge
 import prometheus_client
-import re, socket, time, os
+import re, socket, time, os, dns.resolver
+from socket import AF_INET
+from socket import SOCK_STREAM
+from socket import socket
 
 
 prometheus_client.REGISTRY.unregister(prometheus_client.GC_COLLECTOR)
@@ -14,11 +17,12 @@ metric = Gauge('port_is_not_open',
                 'Check_port_metric',
                 ['hostname','target', 'port', 'name', 'upstream_type'])
 
+
 def find_files():
     files = []
     upstream_files = []
-    for dirpath, dirs, files in os.walk('/etc/nginx/sites-enabled/'):
-        for filename in files:
+    for dirpath, dirs, found_files in os.walk('/home/alex/ansible-playbooks/roles/nginx-balancer/files/nginx'):
+        for filename in found_files:
             fname = os.path.join(dirpath,filename)
             files.append(fname)
     for i in files:
@@ -48,35 +52,38 @@ def parse_nginx_configs(files):
     return upstreams
 
 
-def check_port(upstream):
-    upstream_name, address, port, upstream_type = i[0], i[1], i[2], i[3]
+def check_port(i):
+    upstream_name, address, port, upstream_type = i[0], i[1], int(i[2]), i[3]
     with socket(AF_INET, SOCK_STREAM) as sock:
         sock.settimeout(0.2)
         try:
-            result = sock.connect((address, port))
-        except:
+            ip = str(dns.resolver.resolve(address, 'A')[0])
+            result = sock.connect_ex((ip, port))
+        except Exception as e:
             # log = 'logging error'
             pass
-        finally:
+        else:
             metric_value = 0 if result == 0 else port
             metric.labels(hostname.nodename,
-                          address,
-                          port,
-                          upstream_name,
-                          upstream_type).set(metric_value)
+                            address,
+                            port,
+                            upstream_name,
+                            upstream_type).set(metric_value)
 
 
 def update_metrics(upstreams):
     futures = []
     update_delay = 30
+    metric.clear()
     while True:
         if len(futures) > 0:
             for task in futures:
                 if task.done():
+                    print(f'remove: {task}')
                     futures.remove(task)
         with ThreadPoolExecutor(4) as executor:
-            futures = executor.map(check_port, upstreams)
-        time.sleep(10)
+            futures = [executor.submit(check_port, i) for i in upstreams]
+        time.sleep(100)
         update_delay -= 10
         if update_delay == 0:
             break
