@@ -1,52 +1,92 @@
+from concurrent.futures import ThreadPoolExecutor
 from prometheus_client import start_http_server, Gauge
-import socket
-import time
+import prometheus_client
+import re, socket, time, os
 
-_hostname = 'this_hostname'
-_hosts = {
-'host01':'192.168.100.1',
-'host02':'192.168.100.2',
-'host03':'192.168.100.3'
-}
-_ports = (8010, 8020, 8030)
 
-def create_obj():
-    objs = list()
-    for k,v in _hosts.items():
-        for p in _ports:
-            objs.append(Gauge(f"{_hostname}__{k}:{p}__stackname", "Some_metric"))
-    return objs
+prometheus_client.REGISTRY.unregister(prometheus_client.GC_COLLECTOR)
+prometheus_client.REGISTRY.unregister(prometheus_client.PLATFORM_COLLECTOR)
+prometheus_client.REGISTRY.unregister(prometheus_client.PROCESS_COLLECTOR)
 
-_objs = create_obj()
+hostname = os.uname() or 'default'
 
-def get_metric(_target, _port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.1)
-    result = sock.connect_ex((_target, _port))
-    print(result)
-    x = 0
-    if result == 0:
-        x = 0
-    else:
-        x = 1
-    sock.close()
-    return (x)
+metric = Gauge('port_is_not_open',
+                'Check_port_metric',
+                ['hostname','target', 'port', 'name', 'upstream_type'])
 
-def collect_metrics():
-    start = time.time()
-    i = 0
-    for k,v in _hosts.items():
-        for p in _ports:
-            _value = get_metric(v,p)
-            _objs[i].set(_value)
-            i += 1
-    end = time.time()
-    print(end - start)
+def find_files():
+    files = []
+    upstream_files = []
+    for dirpath, dirs, files in os.walk('/etc/nginx/sites-enabled/'):
+        for filename in files:
+            fname = os.path.join(dirpath,filename)
+            files.append(fname)
+    for i in files:
+        with open(i, 'r') as f:
+            content = f.read()
+            if 'upstream upstream_' in content:
+                upstream_files.append(i)
+    return upstream_files
+
+
+def parse_nginx_configs(files):
+    upstreams = []
+    for file in files:
+        with open(file, 'r') as f:
+            lines = f.readlines()
+            upstream_name = None
+            for line in lines:
+                if 'upstream upstream_' in line:
+                    capture = re.search('^upstream upstream_(.*) {', line)
+                    upstream_name = capture.group(1)
+                elif re.search('server (\w.*):(\d+)(.*|;)', line) is not None and 'down' not in line:
+                    match_obj = re.search('server (\w.*):(\d+)(.*|;)', line)
+                    address = match_obj[1]
+                    port = match_obj[2]
+                    upstream_type = 'backup' if 'backup' in match_obj[3] else 'primary'
+                    upstreams.append((upstream_name, address, port, upstream_type))
+    return upstreams
+
+
+def check_port(upstream):
+    upstream_name, address, port, upstream_type = i[0], i[1], i[2], i[3]
+    with socket(AF_INET, SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        try:
+            result = sock.connect((address, port))
+        except:
+            # log = 'logging error'
+            pass
+        finally:
+            metric_value = 0 if result == 0 else port
+            metric.labels(hostname.nodename,
+                          address,
+                          port,
+                          upstream_name,
+                          upstream_type).set(metric_value)
+
+
+def update_metrics(upstreams):
+    futures = []
+    update_delay = 30
+    while True:
+        if len(futures) > 0:
+            for task in futures:
+                if task.done():
+                    futures.remove(task)
+        with ThreadPoolExecutor(4) as executor:
+            futures = executor.map(check_port, upstreams)
+        time.sleep(10)
+        update_delay -= 10
+        if update_delay == 0:
+            break
+
 
 if __name__ == '__main__':
     # Start up the server to expose the metrics.
-    start_http_server(8100)
+    start_http_server(9900)
 
     while True:
-        collect_metrics()
-        time.sleep(10)
+        files = find_files()
+        upstreams = parse_nginx_configs(files)
+        update_metrics(upstreams)
