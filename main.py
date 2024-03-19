@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from prometheus_client import start_http_server, Gauge
 import prometheus_client
-import re, socket, time, os, dns.resolver
+import re, socket, time, os, dns.resolver, ipaddress, crossplane
 from socket import AF_INET
 from socket import SOCK_STREAM
 from socket import socket
@@ -18,46 +18,43 @@ metric = Gauge('port_is_not_open',
                 ['hostname','target', 'port', 'name', 'upstream_type'])
 
 
-def find_files():
-    files = []
-    upstream_files = []
-    for dirpath, dirs, found_files in os.walk('/home/alex/ansible-playbooks/roles/nginx-balancer/files/nginx'):
-        for filename in found_files:
-            fname = os.path.join(dirpath,filename)
-            files.append(fname)
-    for i in files:
-        with open(i, 'r') as f:
-            content = f.read()
-            if 'upstream upstream_' in content:
-                upstream_files.append(i)
-    return upstream_files
-
-
-def parse_nginx_configs(files):
+def get_upstreams():
+    payload = crossplane.parse('/etc/nginx/nginx.conf')
+    ustream_configs = []
     upstreams = []
-    for file in files:
-        with open(file, 'r') as f:
-            lines = f.readlines()
-            upstream_name = None
-            for line in lines:
-                if 'upstream upstream_' in line:
-                    capture = re.search('^upstream upstream_(.*) {', line)
-                    upstream_name = capture.group(1)
-                elif re.search('server (\w.*):(\d+)(.*|;)', line) is not None and 'down' not in line:
-                    match_obj = re.search('server (\w.*):(\d+)(.*|;)', line)
-                    address = match_obj[1]
-                    port = match_obj[2]
-                    upstream_type = 'backup' if 'backup' in match_obj[3] else 'primary'
-                    upstreams.append((upstream_name, address, port, upstream_type))
+
+    for i in payload['config']:
+        if 'upstream' in [d.get('directive') for d in i['parsed']]:
+            ustream_configs.append(i['parsed'])
+
+    for i in ustream_configs:
+        for d in i:
+            if d['directive'] == 'upstream':
+                upstream_name = d['args'][0]
+                for h in d['block']:
+                    if h['directive'] == 'server' and 'down' not in h['args']:
+                        if ':' in h['args'][0]:
+                            address, port = h['args'][0].split(':')
+                        else:
+                            address = h['args'][0]
+                            port = '80'
+                        upstream_type = 'backup' if 'backup' in h['args'] else 'primary'
+                        upstreams.append((upstream_name, address, port, upstream_type))
     return upstreams
 
 
-def check_port(i):
+
+def check_upstream(i):
     upstream_name, address, port, upstream_type = i[0], i[1], int(i[2]), i[3]
+    try:
+        a = ipaddress.ip_address(address)
+    except ValueError:
+        ip = str(dns.resolver.resolve(address, 'A')[0])
+    else:
+        ip = address
     with socket(AF_INET, SOCK_STREAM) as sock:
         sock.settimeout(0.2)
         try:
-            ip = str(dns.resolver.resolve(address, 'A')[0])
             result = sock.connect_ex((ip, port))
         except Exception as e:
             # log = 'logging error'
@@ -73,19 +70,18 @@ def check_port(i):
 
 def update_metrics(upstreams):
     futures = []
-    update_delay = 30
+    reload_delay = 30
     metric.clear()
     while True:
         if len(futures) > 0:
             for task in futures:
                 if task.done():
-                    print(f'remove: {task}')
                     futures.remove(task)
         with ThreadPoolExecutor(4) as executor:
-            futures = [executor.submit(check_port, i) for i in upstreams]
-        time.sleep(100)
-        update_delay -= 10
-        if update_delay == 0:
+            futures = [executor.submit(check_upstream, i) for i in upstreams]
+        time.sleep(5)
+        reload_delay -= 5
+        if reload_delay == 0:
             break
 
 
@@ -94,6 +90,5 @@ if __name__ == '__main__':
     start_http_server(9900)
 
     while True:
-        files = find_files()
-        upstreams = parse_nginx_configs(files)
+        upstreams = get_upstreams()
         update_metrics(upstreams)
